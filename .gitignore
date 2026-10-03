@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Local databases (chat history)
+*.db
+*.db-shm
+*.db-wal
+
+# Saved search indexes (we'll create these in Phase 1)
+indexes/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Eval run outputs
+evals/reports/*.json
+
+# Editor / OS
+.vscode/
+.DS_Store

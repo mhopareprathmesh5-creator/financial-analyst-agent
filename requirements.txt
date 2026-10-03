@@ -1,0 +1,28 @@
+# LangGraph runtime + SQLite checkpointer
+langgraph
+langgraph-checkpoint-sqlite
+
+# LangChain core pieces
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# Gemini LLM + embeddings
+langchain-google-genai
+
+# PDF loading + vector search
+pypdf
+faiss-cpu
+
+# Tools
+ddgs
+requests
+
+# UI
+streamlit
+
+# Config
+python-dotenv
+
+# Testing
+pytest
