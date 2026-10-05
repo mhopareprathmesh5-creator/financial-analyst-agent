@@ -24,3 +24,6 @@ evals/reports/*.json
 
 # pytest
 .pytest_cache/
+
+# Annual report PDFs (large; decide in Phase 7 how CI gets them)
+data/reports/*.pdf

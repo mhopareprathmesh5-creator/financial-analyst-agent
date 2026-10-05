@@ -85,3 +85,7 @@ Secrets live in `.env` (see `.env.example`): GOOGLE_API_KEY, ALPHA_VANTAGE_API_K
 - SQLite allows one writer at a time.
 - No delete-chat (must remove checkpoint rows and `indexes/<thread_id>/` together).
 - `langchain-community` is deprecated (warning in tests); migrate in Phase 2.
+
+## Open decisions
+
+- Annual report PDFs in `data/reports/` are gitignored (large files). Phase 7 must decide how CI gets them (commit them, download in CI, or commit a prebuilt eval index).
