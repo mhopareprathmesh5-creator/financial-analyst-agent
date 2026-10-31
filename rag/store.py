@@ -1,8 +1,14 @@
 """Per-chat PDF indexes, saved to disk so they survive app restarts.
 
 PURPOSE: everything to do with uploaded PDFs. It reads a PDF page by page,
-splits it into chunks, embeds them into a FAISS index, saves that index to
-disk, and searches it when the agent asks a question.
+repairs broken-font text, splits it into chunks, embeds them into a FAISS
+index, saves that index to disk, and searches it when the agent asks a
+question.
+
+PDF reading uses pdfplumber + rag/text_repair.py. This was chosen by
+measurement (experiments/pdf_readers/, Finding F2 in CLAUDE.md): it read
+164/164 numbers of a hand-verified answer key correctly, versus 109/164 for
+the pypdf loader we used before.
 
 Each chat has its own index, so one chat can never search another chat's
 documents. Uploading a second PDF adds to the index; uploading the same PDF
@@ -18,7 +24,7 @@ Functions in this file:
     get_embeddings()   create the Gemini embeddings client (once)
     _thread_dir()      folder path for a chat's index (with a safety check)
     list_documents()   which PDFs a chat has
-    _load_pages()      PDF bytes -> list of pages with text
+    _load_pages()      PDF bytes -> list of pages with (repaired) text
     load_store()       load a chat's index from memory or disk
     ingest_pdf()       add a new PDF to a chat's index (the main upload function)
     search()           find the best-matching chunks for a question
@@ -28,20 +34,30 @@ Functions in this file:
 from __future__ import annotations
 
 import hashlib  # SHA-256 fingerprints, to detect duplicate uploads
+import io  # wrap bytes as a file-like object, so pdfplumber can read from memory
 import json  # read/write documents.json
-import os  # delete the temporary PDF file
 import re  # regular expression to validate thread ids
-import tempfile  # temporary file, because PyPDFLoader needs a file path
 from functools import lru_cache  # cache a function's result after the first call
 from pathlib import Path
+from typing import Callable
 
-from langchain_community.document_loaders import PyPDFLoader
+import pdfplumber
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
+from rag.text_repair import repair_text
+
+# Optional progress callback: called as on_progress(fraction_done, message),
+# e.g. on_progress(0.25, "Reading page 84 of 336"). The UI uses it to show a
+# progress bar; tests and scripts can leave it out.
+ProgressCallback = Callable[[float, str], None]
+
+
+def _no_progress(fraction: float, message: str) -> None:
+    """Default callback that ignores progress updates."""
 
 # Indexes that are already loaded, keyed by thread id. Loading from disk is
 # slow, so after the first search in a chat we keep its index in memory and
@@ -96,44 +112,47 @@ def list_documents(thread_id: str) -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _load_pages(file_bytes: bytes, filename: str) -> tuple[list[Document], int]:
-    """Extract the text of each page of a PDF.
+def _load_pages(
+    file_bytes: bytes,
+    filename: str,
+    on_progress: ProgressCallback = _no_progress,
+) -> tuple[list[Document], int]:
+    """Extract and repair the text of each page of a PDF.
 
     Returns two things:
         pages        a list of Documents, one per page that has text
         total pages  how many pages the PDF has, including empty ones
+
+    Calls on_progress after each page, because a 300+ page annual report
+    takes about 2 minutes to read and the UI should show it's not frozen.
     """
-    # Streamlit gives us the upload as bytes in memory, but PyPDFLoader can
-    # only read a file on disk. So: write the bytes to a temporary file...
-    # (delete=False keeps the file after the "with" block so the loader can open it)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
-        temp_file.write(file_bytes)
-        temp_path = temp_file.name
+    pages = []
+    # io.BytesIO makes the uploaded bytes look like an open file, so
+    # pdfplumber can read straight from memory (no temporary file needed).
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        total = len(pdf.pages)
+        for number, page in enumerate(pdf.pages, start=1):
+            # extract_text() rebuilds lines from character positions, which
+            # keeps a table row's label and numbers together on one line.
+            # repair_text() then fixes broken-font glyphs (ϰ -> 4, ...).
+            text = repair_text(page.extract_text() or "")
+            # Skip pages with no text (blank pages, or images without text).
+            if text.strip():
+                pages.append(
+                    Document(
+                        page_content=text,
+                        # `number` starts at 1, so citations match the page
+                        # number a PDF viewer shows.
+                        metadata={"source": filename, "page": number},
+                    )
+                )
+            on_progress(number / total, f"Reading page {number} of {total}")
 
-    try:
-        # ...read it (one Document per page)...
-        raw_pages = PyPDFLoader(temp_path).load()
-    finally:
-        # ...and always delete the temp file afterwards, even if reading failed.
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+            # pdfplumber caches every character of every page it reads.
+            # Clearing it keeps memory flat on a 300+ page report.
+            page.flush_cache()
 
-    # Build clean Documents with just the metadata we need for citations.
-    pages = [
-        Document(
-            page_content=page.page_content,
-            # PyPDFLoader counts pages from 0; we add 1 so citations match the
-            # page numbers a reader sees. "source" is the real filename
-            # (otherwise it would be the random temp file name).
-            metadata={"source": filename, "page": page.metadata.get("page", 0) + 1},
-        )
-        for page in raw_pages
-        # Skip pages with no text (blank pages, or images without text).
-        if page.page_content.strip()
-    ]
-    return pages, len(raw_pages)
+    return pages, total
 
 
 def load_store(thread_id: str, embeddings: Embeddings | None = None) -> FAISS | None:
@@ -174,6 +193,7 @@ def ingest_pdf(
     thread_id: str,
     filename: str,
     embeddings: Embeddings | None = None,
+    on_progress: ProgressCallback = _no_progress,
 ) -> dict:
     """Add a PDF to this chat's index and save it to disk.
 
@@ -182,10 +202,12 @@ def ingest_pdf(
 
     Steps:
         1. Fingerprint the file; stop if this chat already has it
-        2. Extract text page by page
+        2. Extract and repair text page by page
         3. Split pages into overlapping chunks
         4. Embed the chunks into the chat's FAISS index (new or existing)
         5. Save the index and the documents list to disk
+
+    on_progress receives updates during the slow steps (2 and 4), for the UI.
 
     Returns a summary for the UI, e.g.
         {"filename": "tcs.pdf", "sha256": "...", "pages": 300, "chunks": 1200,
@@ -207,8 +229,14 @@ def ingest_pdf(
             # (embedding costs API calls and time).
             return {**doc, "already_indexed": True}
 
-    # Step 2: extract text.
-    pages, total_pages = _load_pages(file_bytes, filename)
+    # Step 2: extract and repair text.
+    try:
+        pages, total_pages = _load_pages(file_bytes, filename, on_progress)
+    except Exception as e:
+        # pdfplumber raises its own error types for corrupt or non-PDF
+        # files. Turn them into a ValueError with a clear message, which the
+        # UI shows to the user instead of crashing.
+        raise ValueError(f"Could not read {filename}. Is it a valid PDF? ({e})") from e
     if not pages:
         # Scanned PDFs are just images of pages, so there's no text to read.
         raise ValueError(
@@ -226,7 +254,9 @@ def ingest_pdf(
     # Each chunk keeps its page's metadata (source + page number).
     chunks = splitter.split_documents(pages)
 
-    # Step 4: embed into FAISS.
+    # Step 4: embed into FAISS. This calls the embeddings API for every
+    # chunk, so it's the other slow step; tell the UI what's happening.
+    on_progress(1.0, f"Embedding {len(chunks)} chunks…")
     embeddings = embeddings or get_embeddings()
     store = load_store(key, embeddings)
     if store is None:

@@ -1,0 +1,7 @@
+# Extra packages needed only to re-run the PDF reader comparison (compare.py).
+# The app itself only needs pdfplumber, which is in the main requirements.txt.
+#   pip install -r experiments/pdf_readers/requirements.txt
+pypdf
+pymupdf==1.28.2
+# Pinned: version 2.0 on PyPI contains no code (Finding F3 in CLAUDE.md).
+pymupdf4llm==1.28.2

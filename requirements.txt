@@ -11,7 +11,9 @@ langchain-text-splitters
 langchain-google-genai
 
 # PDF loading + vector search
-pypdf
+# pdfplumber was chosen by measurement over pypdf/PyMuPDF/pymupdf4llm
+# (experiments/pdf_readers/, Finding F2 in CLAUDE.md)
+pdfplumber
 faiss-cpu
 
 # Tools

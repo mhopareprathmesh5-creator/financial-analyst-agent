@@ -81,13 +81,29 @@ with st.sidebar:
         # This block runs on every rerun while a file sits in the uploader.
         # That's fine: ingest_pdf recognises a file it already indexed by its
         # fingerprint and returns immediately.
+
+        # Progress bar for long uploads (a 300+ page report takes ~2 min).
+        # It's created on the first progress update only, so reruns of an
+        # already-indexed file don't flash an empty bar.
+        progress = {"bar": None}
+
+        def show_progress(fraction: float, message: str):
+            if progress["bar"] is None:
+                progress["bar"] = st.progress(0.0, text=message)
+            progress["bar"].progress(fraction, text=message)
+
         try:
-            with st.spinner(f"Indexing {uploaded_pdf.name}…"):
-                summary = store.ingest_pdf(uploaded_pdf.getvalue(), thread_id, uploaded_pdf.name)
+            summary = store.ingest_pdf(
+                uploaded_pdf.getvalue(), thread_id, uploaded_pdf.name, on_progress=show_progress
+            )
+            if progress["bar"] is not None:
+                progress["bar"].empty()  # remove the bar once indexing is done
             if not summary["already_indexed"]:
                 st.success(f"Indexed {summary['filename']} ({summary['chunks']} chunks)")
         except ValueError as e:
-            # e.g. empty file, or a scanned PDF with no text.
+            # e.g. empty file, not a PDF, or a scanned PDF with no text.
+            if progress["bar"] is not None:
+                progress["bar"].empty()
             st.error(str(e))
 
     # The document list comes from disk (documents.json), not session state,

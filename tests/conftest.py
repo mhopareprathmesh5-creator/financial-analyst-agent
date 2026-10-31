@@ -58,7 +58,7 @@ def fake_pdf(monkeypatch):
     This lets us test everything after PDF reading without real PDF files.
     """
 
-    def load_pages(file_bytes, filename):
+    def load_pages(file_bytes, filename, on_progress=None):
         texts = file_bytes.decode().splitlines()
         pages = [
             Document(page_content=text, metadata={"source": filename, "page": i + 1})
