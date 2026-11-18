@@ -31,8 +31,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 # ---------------- Models ----------------
 # The Gemini model that chats and decides which tools to call.
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.1-flash-lite-preview")
-# The Gemini model that turns text into vectors (embeddings) for search.
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "models/gemini-embedding-2-preview")
+# The Hugging Face model that turns text into vectors (embeddings) for search.
+# It is downloaded once (~130 MB) and then runs locally on the CPU: free, no
+# rate limits, works offline, and report text never leaves the machine.
+# (Gemini embeddings hit the free tier's 100 requests/min limit on a single
+# annual report; Finding F7 in CLAUDE.md.)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+# Hugging Face access token, used only to authenticate the model download
+# (faster downloads, no "unauthenticated" warning). bge-small is a public
+# model, so None also works. Read from HUGGINGFACEHUB_API_TOKEN, falling back
+# to HF_TOKEN, the name Hugging Face's own tools use.
+HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN")
 
 # ---------------- Retrieval ----------------
 # PDFs are cut into chunks of about this many characters before embedding.

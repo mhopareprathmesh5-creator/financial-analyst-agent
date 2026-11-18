@@ -22,7 +22,7 @@ streamlit_app.py     UI entry point
 agent/graph.py       LangGraph agent (chat_node <-> tools loop), SQLite checkpointer, chat list helpers
 agent/tools.py       search_documents, web_search, get_stock_price, calculator
 agent/prompts.py     System prompt
-rag/store.py         PDF ingestion (pdfplumber + repair), per-chat FAISS index saved under indexes/<thread_id>/
+rag/store.py         PDF ingestion (pdfplumber + repair), local bge-small embeddings, per-chat FAISS index under indexes/<model>/<thread_id>/
 rag/text_repair.py   Fixes broken-font glyphs from PDF extraction (TCS: ϰ -> 4 etc.; Finding F1)
 app/history.py       Saved messages -> display turns with sources (no Streamlit, unit-testable)
 tests/               pytest unit tests (offline: fake embeddings; tiny real PDFs via tests/pdf_factory.py)
@@ -42,7 +42,7 @@ streamlit run streamlit_app.py        # run the app
 python -m pytest -v                   # unit tests (offline, free, ~2s)
 ```
 
-Secrets live in `.env` (see `.env.example`): GOOGLE_API_KEY, ALPHA_VANTAGE_API_KEY, LangSmith vars.
+Secrets live in `.env` (see `.env.example`): GOOGLE_API_KEY (chat model), HUGGINGFACEHUB_API_TOKEN (embedding model download only), ALPHA_VANTAGE_API_KEY, LangSmith vars.
 
 ## Key design decisions
 
@@ -51,6 +51,8 @@ Secrets live in `.env` (see `.env.example`): GOOGLE_API_KEY, ALPHA_VANTAGE_API_K
 - **Tool results use `content_and_artifact`:** text for the LLM, structured sources for the UI.
 - **All tunables live in `config.py`** and are env-overridable, so eval experiments change settings, not code.
 - **`build_graph(llm, checkpointer)` takes its dependencies** so evals/tests can swap the model or use an in-memory checkpointer.
+- **Embeddings are local, not Gemini:** `BAAI/bge-small-en-v1.5` via `langchain-huggingface` on CPU (owner's choice after the Gemini free-tier limit, F7). Vectors are normalised; BGE's query instruction is added to questions only. Gemini is used for chat only.
+- **Indexes are stored per embedding model** (`indexes/<model>/<thread_id>/`), so changing the model never mixes incompatible vectors; old chats just need a re-upload.
 - Storage: chats in `chatbot.db` (SQLite, via LangGraph `SqliteSaver`); PDF indexes as files in `indexes/`. Both are gitignored.
 
 ## Conventions
@@ -70,29 +72,55 @@ Secrets live in `.env` (see `.env.example`): GOOGLE_API_KEY, ALPHA_VANTAGE_API_K
 
 ## Roadmap and status
 
+Approach (agreed 2026-11-18): **evaluate each pipeline stage before improving it.**
+
+```
+PDF -> (1) Extraction -> (2) Chunk + embed + retrieve -> (3) Generate answer -> (4) Agent + tools -> answer
+       number accuracy     contextual recall/precision/     faithfulness,         tool correctness,
+       (done, F2)          relevancy, page hit@k, MRR,      answer relevancy,     task completion,
+                           ingestion latency                numeric + citation    refusals, injection
+```
+
 | Phase | Scope | Status |
 |---|---|---|
 | 0 | Setup: git, .gitignore, archive tutorial files, clean requirements | ✅ Done |
-| 1 | Modular backend; bug fixes (persistent indexes, injected thread id, multi-PDF, clean history, uploader reset, titles, citations); 19 unit tests | ✅ Done |
-| 2 | Financial analyst: annual reports, table-aware chunking, expression calculator, Indian stock symbols, news tool, system prompt; migrate off deprecated `langchain-community` | ⏳ Next |
-| 3 | Eval dataset (~120 cases, 6 categories: fact, calculation, live data, should-refuse, no-tool, security); dev/test split | |
-| 4 | Graders: numeric, tool trajectory, citation, LLM judge (non-Gemini family) calibrated against human labels; mock live tools for determinism | |
-| 5 | Baseline run + failure analysis | |
-| 6 | Measured improvements (prompt, chunk size, top-k, hybrid BM25, model); final test-set run | |
-| 7 | GitHub Actions: unit tests + small eval set on every PR, fail on regression | |
-| 8 | README with results, deployment, resume bullets | |
+| 1 | Modular backend; bug fixes (persistent indexes, injected thread id, multi-PDF, clean history, uploader reset, titles, citations); unit tests | ✅ Done |
+| 2 | Stage 1, extraction: pdfplumber + glyph repair chosen by measurement (F1, F2, F6); local bge-small embeddings (F7) | ✅ Done |
+| A | **Golden dataset**: ~60 questions on TCS + Infosys FY25, each with expected answer, **expected source pages**, category (fact, calculation, consolidated-vs-standalone, not-in-report, …). Owner verifies a sample against the PDFs | ⏳ Next |
+| B | **Stage 2, retrieval eval**: deterministic page hit@k / MRR + DeepEval contextual recall / precision / relevancy; baseline → fix known misses (F8) → chunk size, top-k, hybrid BM25, reranker → **upload-speed optimisation under a recall guardrail** (target < 60 s for a 336-page report) | |
+| C | **Stage 3, generation eval**: financial analyst system prompt (consolidated by default, cite pages, calculator for maths); faithfulness, answer relevancy, numeric correctness, citation correctness; prompt versions compared | |
+| D | **Stage 4, agent eval**: expression calculator, Indian stock symbols, news tool; tool correctness, task completion, refusals, prompt-injection tests; live tools mocked for repeatable runs | |
+| E | **Regression gate**: DeepEval + pytest in GitHub Actions on every push, with thresholds | |
+| F | **Ship**: README with all results, deployment (see known limitations), resume bullets from real numbers | |
 
-## Known limitations (deferred to Phase 8 — deployment)
+## Scope rule
 
+**The project is about evals.** Build the eval for a stage **before** changing that stage, then change it only with measured before/after numbers. Speed-ups (e.g. faster ingestion) must hold quality metrics within an agreed guardrail.
+
+## Eval setup
+
+- Framework: **DeepEval** (pytest integration; RAG + agent metrics). RAGAS optional, once, as a cross-check.
+- Judge: **Gemini** (owner's choice, 2026-11-18), using a stronger Gemini model than the agent's Flash-Lite. Same model family judging itself is a known bias, so the judge is **calibrated against the owner's hand labels** on a sample and its agreement is reported.
+- **Deterministic metrics first** (page hit@k, numeric match, tool-call match): free, exact, repeatable. LLM-judged metrics only where code can't decide.
+- Free-tier limits: judge calls cached and rate limited. Eval runs use reports indexed once and reused.
+
+## Known limitations
+
+- **Upload is slow: ~5 min for a 336-page report** (read 109–164 s, embed 189 s; F6/F7). Fixed in **Phase B**, under a retrieval-quality guardrail. Ideas: parallel page reading, larger chunks / ONNX embedding, keyword search available while embeddings build, preloaded sample reports, per-document index reuse.
+
+Deferred to Phase F (deployment):
+
+- `langchain-community` is deprecated (warning in tests).
 - No user accounts: anyone using the app sees every chat. Needs login + per-user chat ownership.
 - SQLite and `indexes/` are local files; Streamlit Cloud wipes disk on redeploy. Move chats to Postgres (e.g. Neon) and indexes to persistent storage.
 - SQLite allows one writer at a time.
-- No delete-chat (must remove checkpoint rows and `indexes/<thread_id>/` together).
-- `langchain-community` is deprecated (warning in tests); migrate in Phase 2.
+- No delete-chat (must remove checkpoint rows and `indexes/<model>/<thread_id>/` together).
+- Free-tier rate limits on Gemini (agent and judge) will bite on repeated eval runs; see "Eval setup".
 
 ## Open decisions
 
-- Annual report PDFs in `data/reports/` are gitignored (large files). Phase 7 must decide how CI gets them (commit them, download in CI, or commit a prebuilt eval index).
+- Annual report PDFs in `data/reports/` are gitignored (large files). Phase E must decide how CI gets them (commit them, download in CI, or commit a prebuilt eval index).
+- Which stronger Gemini model is the judge (decide in Phase B when the first LLM-judged metric runs, based on free-tier availability).
 
 ## Findings (for the final README / write-up)
 
@@ -145,3 +173,17 @@ Only measured or verified facts; each names the file that produced it. Include f
 - Full TCS report: 336/336 pages with text, **164 s to read** (0.49 s/page; slower than the 0.30 s/page sample estimate in F2). Broken "4" glyphs remaining: **0** (was 2,591). P&L check: `Revenue from operations 12 2,55,324 2,40,893`, `Earnings per equity share:- Basic and diluted (₹) 18 134.19 125.88`, both correct.
 - **1,244 unrecognised `(cid:N)` codes remain on 148 pages.** They are letters in *other* broken fonts in narrative/legal text, not the financial tables, e.g. `De(cid:448)elo(cid:393)men(cid:410)` = "Development". Each code is rare. **Decision: not mapped yet**; revisit only if Phase 5 failure analysis shows retrieval misses on those pages.
 - Word spacing stays broken in TCS narrative text ("Letter fro m the CEO", "Signif icant innov ation") — see F4.
+
+### F7. Gemini embeddings hit the free-tier limit; switched to local bge-small (2026-11-02, Phase 2.1)
+- Uploading the TCS report with Gemini embeddings (`gemini-embedding-2`) failed with `429 RESOURCE_EXHAUSTED`: free tier allows **100 embed requests per minute**, and each chunk counts as one request. One report needs ~1,400 chunks, and Phase 6 experiments re-embed both reports repeatedly.
+- Owner's decision: local `BAAI/bge-small-en-v1.5` (Hugging Face, `langchain-huggingface` + sentence-transformers, CPU). Free, no limits, offline, report text stays local.
+- Measured on the full TCS report through the real `ingest_pdf` (scratch index): model load **11 s**; read + repair **109 s**; chunk + embed + save **189 s** for **1,415 chunks** (~7.5 chunks/s on CPU). Total ≈ 5 min, no errors. (Read time varies run to run: 164 s in F6, 109 s here.)
+
+### F8. Retrieval spot check reveals standalone vs consolidated confusion (2026-11-02, Phase 2.1)
+- Spot check only (4 questions, top-4 chunks, bge-small, chunk 1000/200), not a measured eval; it shows what the eval set must cover.
+- **Annual reports contain two sets of financial statements**: consolidated (whole group) and standalone (parent company only), with different numbers. Retrieval mixed them:
+  - "Basic earnings per share?" → standalone EPS ₹132.83 (p253) ranked above the consolidated ₹134.19 (p181, not in top 4).
+  - "Revenue from Europe?" → top hit standalone ₹59,339 crore (p287); consolidated ₹79,487 crore (p230) second.
+- "Revenue from operations FY2025?" → p88 (MD&A financial overview table), a sensible hit, though not the P&L page 181.
+- "Who is the CEO?" → **no relevant chunk** in top 4 (all p87 marketing text). Possible cause: broken spacing in "Letter fro m the CEO" (F4).
+- Implications: eval set needs consolidated-vs-standalone cases; the system prompt should default to consolidated figures and say which one it used; retrieval improvements (top-k, hybrid BM25) to be measured in Phase 6.

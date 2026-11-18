@@ -80,6 +80,20 @@ def test_unsafe_thread_ids_are_rejected(bad_id):
         store.ingest_pdf(REPORT, bad_id, "report.pdf")
 
 
+def test_indexes_from_different_embedding_models_never_mix(monkeypatch):
+    """Vectors from two embedding models can't be compared, so switching the
+    model must not reuse (or crash on) an index built with the old one. Each
+    model keeps its own folder; the old chat just looks empty until re-upload."""
+    import config
+
+    store.ingest_pdf(REPORT, "thread-a", "report.pdf")
+
+    monkeypatch.setattr(config, "EMBEDDING_MODEL", "some-org/other-model")
+
+    assert store.list_documents("thread-a") == []
+    assert store.search("thread-a", "revenue") == []
+
+
 def test_empty_file_is_rejected():
     """An empty upload gives a clear error instead of crashing later."""
     with pytest.raises(ValueError):

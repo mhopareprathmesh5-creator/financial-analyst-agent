@@ -7,8 +7,13 @@ langchain-core
 langchain-community
 langchain-text-splitters
 
-# Gemini LLM + embeddings
+# Gemini chat model
 langchain-google-genai
+
+# Local embeddings: BAAI/bge-small-en-v1.5 from Hugging Face, run on CPU
+# (sentence-transformers also installs PyTorch)
+langchain-huggingface
+sentence-transformers
 
 # PDF loading + vector search
 # pdfplumber was chosen by measurement over pypdf/PyMuPDF/pymupdf4llm

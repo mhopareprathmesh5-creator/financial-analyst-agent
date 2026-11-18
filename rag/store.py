@@ -14,14 +14,21 @@ Each chat has its own index, so one chat can never search another chat's
 documents. Uploading a second PDF adds to the index; uploading the same PDF
 again is detected by its SHA-256 fingerprint and skipped.
 
-Layout on disk, one folder per chat thread:
+Embeddings come from a local Hugging Face model (config.EMBEDDING_MODEL,
+BAAI/bge-small-en-v1.5), run on the CPU with sentence-transformers.
 
-    indexes/<thread_id>/index.faiss      FAISS vectors
-    indexes/<thread_id>/index.pkl        chunk texts + metadata
-    indexes/<thread_id>/documents.json   which PDFs are in this index
+Layout on disk, one folder per embedding model, then one per chat thread:
+
+    indexes/<model>/<thread_id>/index.faiss      FAISS vectors
+    indexes/<model>/<thread_id>/index.pkl        chunk texts + metadata
+    indexes/<model>/<thread_id>/documents.json   which PDFs are in this index
+
+e.g. indexes/BAAI__bge-small-en-v1.5/3f2a.../. Vectors from different models
+can't be compared, so each model gets its own folder: switching models never
+mixes them, and indexes from different models can sit side by side.
 
 Functions in this file:
-    get_embeddings()   create the Gemini embeddings client (once)
+    get_embeddings()   load the local embedding model (once)
     _thread_dir()      folder path for a chat's index (with a safety check)
     list_documents()   which PDFs a chat has
     _load_pages()      PDF bytes -> list of pages with (repaired) text
@@ -59,9 +66,10 @@ ProgressCallback = Callable[[float, str], None]
 def _no_progress(fraction: float, message: str) -> None:
     """Default callback that ignores progress updates."""
 
-# Indexes that are already loaded, keyed by thread id. Loading from disk is
-# slow, so after the first search in a chat we keep its index in memory and
-# reuse it for every later question.
+# Indexes that are already loaded, keyed by their folder path (which includes
+# the embedding model and the thread id). Loading from disk is slow, so after
+# the first search in a chat we keep its index in memory and reuse it for
+# every later question.
 _STORE_CACHE: dict[str, FAISS] = {}
 
 # Allowed thread ids: only letters, digits, "_" and "-", 1 to 64 characters.
@@ -69,23 +77,55 @@ _STORE_CACHE: dict[str, FAISS] = {}
 _SAFE_THREAD_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+# BGE models were trained with this instruction in front of search queries
+# (but not in front of the passages being searched). Adding it to questions
+# only is the model authors' recommended usage for retrieval.
+BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+
+
 @lru_cache(maxsize=1)
 def get_embeddings() -> Embeddings:
-    """Create the Gemini embeddings client.
+    """Load the local Hugging Face embedding model (BAAI/bge-small-en-v1.5).
+
+    The first call downloads the model (~130 MB) into the Hugging Face cache
+    folder; after that it loads from disk and runs offline on the CPU.
 
     @lru_cache means this runs only once; every later call returns the same
-    client instead of creating a new one.
+    loaded model instead of loading it again (loading takes a few seconds).
 
     The import is inside the function so that tests (which use fake
-    embeddings) never need the Gemini library or an API key.
+    embeddings) never load PyTorch or the model.
     """
-    from langchain_google_genai import GoogleGenerativeAIEmbeddings
+    from langchain_huggingface import HuggingFaceEmbeddings
 
-    return GoogleGenerativeAIEmbeddings(model=config.EMBEDDING_MODEL)
+    # Settings shared by documents and queries:
+    #   normalize_embeddings=True scales every vector to length 1. Then
+    #   FAISS's default distance (L2) ranks results exactly like cosine
+    #   similarity, which is what BGE was trained for.
+    normalise = {"normalize_embeddings": True}
+
+    return HuggingFaceEmbeddings(
+        model_name=config.EMBEDDING_MODEL,
+        # Passed to sentence-transformers when loading the model:
+        #   device="cpu"  run on the processor (no graphics card needed)
+        #   token         Hugging Face access token, used for the download
+        model_kwargs={"device": "cpu", "token": config.HF_TOKEN},
+        # Used when embedding document chunks (at upload): plain text.
+        encode_kwargs=normalise,
+        # Used when embedding a question (at search): with BGE's instruction.
+        query_encode_kwargs={**normalise, "prompt": BGE_QUERY_INSTRUCTION},
+    )
+
+
+def _model_folder_name() -> str:
+    """Folder-safe name for the embedding model:
+    "BAAI/bge-small-en-v1.5" -> "BAAI__bge-small-en-v1.5"."""
+    return config.EMBEDDING_MODEL.replace("/", "__")
 
 
 def _thread_dir(thread_id: str) -> Path:
-    """Return the folder where this chat's index lives: indexes/<thread_id>.
+    """Return the folder where this chat's index lives:
+    indexes/<model>/<thread_id>.
 
     The leading "_" means it's a private helper, only used inside this file.
     """
@@ -95,8 +135,8 @@ def _thread_dir(thread_id: str) -> Path:
     # "path traversal" attack.
     if not _SAFE_THREAD_ID.match(thread_id):
         raise ValueError(f"Invalid thread id: {thread_id!r}")
-    # In pathlib, "/" joins paths: INDEX_DIR / "abc" -> indexes/abc
-    return config.INDEX_DIR / thread_id
+    # In pathlib, "/" joins paths: INDEX_DIR / "a" / "b" -> indexes/a/b
+    return config.INDEX_DIR / _model_folder_name() / thread_id
 
 
 def list_documents(thread_id: str) -> list[dict]:
@@ -163,13 +203,16 @@ def load_store(thread_id: str, embeddings: Embeddings | None = None) -> FAISS | 
         2. disk (indexes/<id>/)   e.g. right after the app restarts
         3. nowhere                this chat has no PDF -> None
 
-    `embeddings` can be passed in by tests; normally it's None and we use Gemini.
+    `embeddings` can be passed in by tests; normally it's None and we use the
+    local Hugging Face model.
     """
-    key = str(thread_id)
+    folder = _thread_dir(thread_id)
+    # Keyed by folder, so an index built with a different embedding model is
+    # never served from the cache by mistake.
+    key = str(folder)
     if key in _STORE_CACHE:
         return _STORE_CACHE[key]
 
-    folder = _thread_dir(key)
     if not (folder / "index.faiss").exists():
         return None
 
@@ -269,7 +312,7 @@ def ingest_pdf(
 
     # Step 5: save to disk so the index survives an app restart.
     folder = _thread_dir(key)
-    folder.mkdir(parents=True, exist_ok=True)  # create indexes/<id>/ if needed
+    folder.mkdir(parents=True, exist_ok=True)  # create indexes/<model>/<id>/ if needed
     store.save_local(str(folder))  # writes index.faiss and index.pkl
 
     # Record this PDF in documents.json (shown in the sidebar, and used for
@@ -285,7 +328,7 @@ def ingest_pdf(
         json.dumps(documents, indent=2), encoding="utf-8"
     )
 
-    _STORE_CACHE[key] = store
+    _STORE_CACHE[str(folder)] = store
     # {**entry, ...} copies all keys of entry and adds "already_indexed".
     return {**entry, "already_indexed": False}
 
