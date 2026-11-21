@@ -28,7 +28,10 @@ app/history.py       Saved messages -> display turns with sources (no Streamlit,
 tests/               pytest unit tests (offline: fake embeddings; tiny real PDFs via tests/pdf_factory.py)
 experiments/         Measured experiments behind design choices, with their results
   pdf_readers/       PDF reader comparison vs hand-verified answer key (Finding F2); own requirements.txt
-evals/               LLM eval harness (Phase 3+): datasets/, graders/, reports/
+evals/               Eval harness
+  datasets/          golden.jsonl (60 questions) + schema.py (validation, load())
+  graders/           metrics
+  reports/           eval run outputs (*.json gitignored, *.md committed)
 data/reports/        Annual report PDFs used for evals
 archive/             Original tutorial code, kept for reference only; do not edit or import
 ```
@@ -86,8 +89,8 @@ PDF -> (1) Extraction -> (2) Chunk + embed + retrieve -> (3) Generate answer -> 
 | 0 | Setup: git, .gitignore, archive tutorial files, clean requirements | ✅ Done |
 | 1 | Modular backend; bug fixes (persistent indexes, injected thread id, multi-PDF, clean history, uploader reset, titles, citations); unit tests | ✅ Done |
 | 2 | Stage 1, extraction: pdfplumber + glyph repair chosen by measurement (F1, F2, F6); local bge-small embeddings (F7) | ✅ Done |
-| A | **Golden dataset**: ~60 questions on TCS + Infosys FY25, each with expected answer, **expected source pages**, category (fact, calculation, consolidated-vs-standalone, not-in-report, …). Owner verifies a sample against the PDFs | ⏳ Next |
-| B | **Stage 2, retrieval eval**: deterministic page hit@k / MRR + DeepEval contextual recall / precision / relevancy; baseline → fix known misses (F8) → chunk size, top-k, hybrid BM25, reranker → **upload-speed optimisation under a recall guardrail** (target < 60 s for a 336-page report) | |
+| A | **Golden dataset** `evals/datasets/golden.jsonl`: 60 questions (30 TCS, 30 Infosys; 40 dev / 20 test), each with expected answer, values, **expected PDF pages**, statement, category. Structure enforced by `evals/datasets/schema.py` + `tests/test_golden_dataset.py`; 19 entries verified by the owner against the PDFs | ✅ Done |
+| B | ⏳ **Stage 2, retrieval eval**: deterministic page hit@k / MRR + DeepEval contextual recall / precision / relevancy; baseline → fix known misses (F8) → chunk size, top-k, hybrid BM25, reranker → **upload-speed optimisation under a recall guardrail** (target < 60 s for a 336-page report) | |
 | C | **Stage 3, generation eval**: financial analyst system prompt (consolidated by default, cite pages, calculator for maths); faithfulness, answer relevancy, numeric correctness, citation correctness; prompt versions compared | |
 | D | **Stage 4, agent eval**: expression calculator, Indian stock symbols, news tool; tool correctness, task completion, refusals, prompt-injection tests; live tools mocked for repeatable runs | |
 | E | **Regression gate**: DeepEval + pytest in GitHub Actions on every push, with thresholds | |
@@ -187,3 +190,18 @@ Only measured or verified facts; each names the file that produced it. Include f
 - "Revenue from operations FY2025?" → p88 (MD&A financial overview table), a sensible hit, though not the P&L page 181.
 - "Who is the CEO?" → **no relevant chunk** in top 4 (all p87 marketing text). Possible cause: broken spacing in "Letter fro m the CEO" (F4).
 - Implications: eval set needs consolidated-vs-standalone cases; the system prompt should default to consolidated figures and say which one it used; retrieval improvements (top-k, hybrid BM25) to be measured in Phase 6.
+
+### F9. Golden dataset built (2026-11-19, Phase A)
+- 60 questions: fact 16, consolidated-vs-standalone 12, narrative 11, calculation 8, multi-location 7, not-in-report 6; 30 per report; 40 dev / 20 test fixed before any results existed.
+- Every answer checked against a rendered page image (tables) or the repaired page text (prose); calculation answers computed in Python. **19/60 independently verified by the owner** against the PDFs; no errors found in the owner's sample.
+- Deliberately hard cases: 3 false-premise questions (TCS revenue "decline", Infosys FY25 "special dividend", MRE acquisition "completed"); not-in-report traps where the year/term does appear in an unrelated context (TCS "2009-10" tax years, "June 30, 2025" results calendar; Infosys "fiscal 2026" CSR plan, "ESG Vision 2030"); a bar-chart answer whose extracted text has no labels (Infosys North America 57.9%); the same number in Indian and international formats; FY2024 EPS reported (125.88) vs adjusted (127.74).
+- Dropped one candidate during building: "Infosys revenue from Japan" was not cleanly absent (subsidiary HIPUS turnover on p44 could count as an answer). Ambiguous not-in-report questions make an eval unfair.
+
+### F10. Retrieval baseline is poor: hit@4 = 24.3% (2026-11-21, Phase B)
+- Run: `python -m evals.retrieval_eval --label baseline` → `evals/reports/retrieval_20261121-222530_baseline.md`. Dev split, 37 questions (not-in-report excluded), bge-small, chunk 1000 / overlap 200, plain vector search.
+- **hit@1 2.7% · hit@4 24.3% · hit@10 37.8% · MRR 0.140 · value_hit@4 29.6%.** Only 9/37 questions get a chunk from an expected page into the 4 chunks the agent sees.
+- By category (hit@4): consolidated-vs-standalone 37.5%, multi-location 33.3%, narrative 28.6%, calculation 20.0%, **fact 9.1%**.
+- **Sanity check before trusting it (F5 lesson):** for the misses, the expected number is absent from the top-4 retrieved chunks in all but one case, so the misses are real retrieval failures, not an answer key that missed valid pages.
+- What search returns instead: **TCS** — summary/narrative pages (p88 MD&A overview, p22–23 Financial Capital, p70 Board's report) for nearly every financial question. **Infosys** — the subsidiary financials table (AOC-1, p45–48: every subsidiary's turnover and profit) and p73, which look like "revenue/profit" text but are about other entities.
+- Indexing time on this run: Infosys 369 pages → 1,570 chunks, read 59.9 s + embed 242.8 s; TCS 336 pages → 1,415 chunks, read 122.4 s + embed 211.6 s.
+- Hypotheses to test, one at a time: table chunks lose their heading (a chunk from the middle of the P&L doesn't say "Consolidated Statement of Profit and Loss"); a small embedding model is weak on number-heavy tables; exact terms like "Revenue from operations" need keyword search (BM25); a reranker; broken TCS word spacing (F4).
