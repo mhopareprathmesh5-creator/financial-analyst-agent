@@ -76,6 +76,11 @@ RRF_K = int(os.getenv("RRF_K", "60"))
 QUERY_REWRITES = int(os.getenv("QUERY_REWRITES", "0"))
 # The model that writes the rewrites (a small, fast one is enough).
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", CHAT_MODEL)
+# When merging, the original question's result lists count this many times
+# as much as each rewrite's, so rewrites add candidates without drowning out
+# the user's own wording (Finding F15). Fixed at 2 up front rather than tuned
+# on the dev set, to avoid fitting the setting to our own questions.
+ORIGINAL_QUERY_WEIGHT = float(os.getenv("ORIGINAL_QUERY_WEIGHT", "2"))
 
 # ---------------- Storage ----------------
 # SQLite file where LangGraph saves every conversation (chat memory).

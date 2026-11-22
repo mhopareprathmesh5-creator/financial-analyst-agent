@@ -280,3 +280,20 @@ Only measured or verified facts; each names the file that produced it. Include f
 - **Failure 1 — the rewriter adds facts:** with no year in the question, Gemini inserted the wrong one ("TCS annual report **2023-24** Chief Financial Officer", "statutory auditor … financial year **2023-24**"; the report is 2024-25), despite "don't add facts" in the prompt.
 - **Failure 2 — verbose boilerplate:** rewrites like "Tata Consultancy Services Limited consolidated … for the financial year ended March 31, 2025" are full of words found on hundreds of pages; BM25 then favours generic pages (TCS p302, p200, p186) over the statements, and the original question is only 2 of 8 merged lists. Most losses are questions that worked before (TCS revenue, profit, dividend).
 - Overfitting caution: further prompt tuning is evaluated on the same dev questions; only general rules are allowed, and the untouched test split gives the final number.
+
+### F16. Experiment 4: query rewriting prompt v2 + weighted original (2026-11-22, Phase B)
+- Changes (general rules only, no dataset terms): prompt v2 adds "never add a year, date, company name or any other fact not in the question" and "3 to 8 words, keywords only"; the original question's ranked lists get weight 2 in RRF (`ORIGINAL_QUERY_WEIGHT`, fixed up front, not tuned). Run: `retrieval_*_hybrid-rewrite3-v2.md`.
+- Rewrite quality, v1 → v2 (153 rewrites each): average length **13.7 → 4.8 words**; rewrites with a year **134 → 0**; with a company name **153 → 0**; invented years **0**. Example: "Which firm audits Infosys's accounts?" → "Statutory auditor appointment" / "Independent auditor firm name" / "Statutory audit firm details".
+
+| hit@4 | hybrid | rewrite v1 | rewrite v2 |
+|---|---|---|---|
+| user's wording (14) | 21.4% | 35.7% | **57.1%** |
+| report's wording, same 14 | 42.9% | 28.6% | **57.1%** |
+| all 37 originals | 48.6% | 48.6% | **56.8%** |
+| hit@1, all originals | 21.6% | 24.3% | **35.1%** |
+| MRR, all originals | 0.362 | 0.362 | **0.464** |
+
+- vs hybrid at hit@4: **11 gained, 3 lost** (all dividend questions: "dividend per share" appears on many pages).
+- **The wording gap from F13 is closed:** user wording and report wording both 57.1% on the paired 14.
+- Progress so far on the 37 original dev questions, hit@4: baseline 24.3% → headings 29.7% → hybrid 48.6% → **rewrite v2 56.8%**; hit@1 2.7% → **35.1%**.
+- Caveats: tuned on the dev split (test split untouched); one extra Gemini call per search, whose latency in the app isn't measured yet (rewrites were cached in this run).

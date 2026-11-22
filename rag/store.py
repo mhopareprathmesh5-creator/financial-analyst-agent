@@ -409,9 +409,15 @@ def search(
 
     # Otherwise merge. Take more candidates than needed from each list, so a
     # chunk ranked e.g. 15th by one list can still win if others rank it high.
+    # The original question's lists get ORIGINAL_QUERY_WEIGHT; rewrites get 1.
     n = max(k, config.HYBRID_CANDIDATES)
-    lists = [lst for q in queries for lst in _ranked_lists(store, thread_id, q, n, mode)]
-    return rrf_merge(lists, k=k, rrf_k=config.RRF_K)
+    lists, weights = [], []
+    for i, q in enumerate(queries):
+        weight = config.ORIGINAL_QUERY_WEIGHT if i == 0 else 1.0
+        for lst in _ranked_lists(store, thread_id, q, n, mode):
+            lists.append(lst)
+            weights.append(weight)
+    return rrf_merge(lists, k=k, rrf_k=config.RRF_K, weights=weights)
 
 
 def _ranked_lists(store: FAISS, thread_id: str, query: str, n: int, mode: str) -> list[list[Document]]:

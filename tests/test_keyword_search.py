@@ -45,6 +45,16 @@ def test_rrf_rewards_chunks_ranked_high_by_both_lists():
     assert [d.page_content for d in merged] == ["b", "a", "c"]
 
 
+def test_rrf_weights_let_one_list_count_more():
+    a, b = doc("a", 1), doc("b", 2)
+    # Unweighted, the two lists disagree and tie; the first list's top chunk
+    # wins only once that list has extra weight.
+    merged = rrf_merge([[a, b], [b, a]], k=2, weights=[2.0, 1.0])
+    assert [d.page_content for d in merged] == ["a", "b"]
+    merged = rrf_merge([[a, b], [b, a]], k=2, weights=[1.0, 2.0])
+    assert [d.page_content for d in merged] == ["b", "a"]
+
+
 def test_rrf_matches_the_same_chunk_from_different_lists():
     # Same text and page but separate objects (as FAISS and BM25 return them):
     # they must be merged into one result, not listed twice.

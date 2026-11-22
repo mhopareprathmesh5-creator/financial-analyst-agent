@@ -230,6 +230,8 @@ def main():
                    "RETRIEVAL_MODE": config.RETRIEVAL_MODE, "HYBRID_CANDIDATES": config.HYBRID_CANDIDATES,
                    "RRF_K": config.RRF_K, "QUERY_REWRITES": config.QUERY_REWRITES,
                    "REWRITE_MODEL": config.REWRITE_MODEL if config.QUERY_REWRITES else None,
+                   "REWRITE_PROMPT": query_rewrite.PROMPT_VERSION if config.QUERY_REWRITES else None,
+                   "ORIGINAL_QUERY_WEIGHT": config.ORIGINAL_QUERY_WEIGHT if config.QUERY_REWRITES else None,
                    "k_values": list(K_VALUES)},
         "n_questions": len(results),
         "mean_latency_s": statistics.mean(r["latency_s"] for r in results),

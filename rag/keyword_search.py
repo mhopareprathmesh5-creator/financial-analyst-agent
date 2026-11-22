@@ -85,18 +85,28 @@ def _key(doc: Document) -> tuple:
     return (doc.metadata.get("source"), doc.metadata.get("page"), doc.page_content)
 
 
-def rrf_merge(result_lists: list[list[Document]], k: int, rrf_k: int = 60) -> list[Document]:
+def rrf_merge(
+    result_lists: list[list[Document]],
+    k: int,
+    rrf_k: int = 60,
+    weights: list[float] | None = None,
+) -> list[Document]:
     """Merge several ranked lists into one with Reciprocal Rank Fusion.
 
     Each list is best-first. A chunk's score is the sum over lists of
-    1 / (rrf_k + rank), rank starting at 1. Returns the top k, best first.
+    weight / (rrf_k + rank), rank starting at 1. Returns the top k, best first.
+
+    weights (one per list, default all 1.0) let some lists count more. Query
+    rewriting uses this to give the user's original question extra say, so
+    the rewrites add candidates without drowning it out (Finding F15).
     """
+    weights = weights or [1.0] * len(result_lists)
     scores: dict[tuple, float] = {}
     docs: dict[tuple, Document] = {}
-    for results in result_lists:
+    for results, weight in zip(result_lists, weights):
         for rank, doc in enumerate(results, start=1):
             key = _key(doc)
-            scores[key] = scores.get(key, 0.0) + 1.0 / (rrf_k + rank)
+            scores[key] = scores.get(key, 0.0) + weight / (rrf_k + rank)
             docs.setdefault(key, doc)
     best = sorted(scores, key=scores.get, reverse=True)
     return [docs[key] for key in best[:k]]

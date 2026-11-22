@@ -26,16 +26,20 @@ import config
 
 # Bump this when the prompt changes, so cached rewrites from the old prompt
 # are never reused for the new one.
-PROMPT_VERSION = "v1"
+#   v1  general rewrite instruction (Finding F15: good vocabulary, but it
+#       invented years like "2023-24" and wrote long boilerplate queries)
+#   v2  adds: never add years / names / facts; short keyword-style queries
+PROMPT_VERSION = "v2"
 
 PROMPT = """You help search a company's annual report (an Indian listed company, \
 financial statements under Ind AS). Rewrite the user's question into {n} different \
-search queries that use the formal terminology an annual report itself would use \
-for the same thing.
+short search queries that use the formal terminology an annual report itself would \
+use for the same thing.
 
 Rules:
-- Keep the same meaning and the same company, year and scope; don't add facts.
-- Use the words that appear in annual reports and financial statements, not casual words.
+- Translate casual words into the report's formal terms; keep the same meaning and scope.
+- Never add a year, date, company name or any other fact that is not in the user's question.
+- Keep each query short: 3 to 8 words, keywords only, no filler like "details of" or "as per".
 - Each query on its own line. No numbering, no explanations.
 
 User question: {question}"""
