@@ -66,3 +66,25 @@ def test_validator_accepts_a_good_entry():
 def test_validator_catches_mistakes(change, expected_problem):
     entry = {**GOOD, **change}
     assert any(expected_problem in p for p in schema.validate(entry))
+
+
+def write_jsonl(path, entries):
+    import json
+
+    path.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+
+
+def test_paraphrase_must_keep_its_originals_split(tmp_path):
+    """A paraphrase of a held-out test question placed in dev would leak the
+    test set into tuning; load() must refuse it."""
+    original = {**GOOD, "id": "orig", "split": "test"}
+    paraphrase = {**GOOD, "id": "para", "split": "dev", "question": "q2?", "paraphrase_of": "orig"}
+    write_jsonl(tmp_path / "g.jsonl", [original, paraphrase])
+    with pytest.raises(ValueError, match="'split' differs"):
+        schema.load(tmp_path / "g.jsonl")
+
+
+def test_paraphrase_must_point_to_an_existing_original(tmp_path):
+    write_jsonl(tmp_path / "g.jsonl", [{**GOOD, "id": "para", "paraphrase_of": "missing"}])
+    with pytest.raises(ValueError, match="does not exist"):
+        schema.load(tmp_path / "g.jsonl")

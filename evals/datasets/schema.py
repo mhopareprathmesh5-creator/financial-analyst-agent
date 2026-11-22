@@ -28,8 +28,16 @@ One entry (one line of golden.jsonl):
       "split": "dev",                          dev (for tuning) | test (held out)
       "verified": "owner",                     claude | owner (who checked it
                                                against the PDF)
+      "paraphrase_of": "tcs-eps-cons-01",      optional: this entry asks the
+                                               same thing as another entry in a
+                                               user's own words (same answer,
+                                               values and pages, same split)
       "notes": "..."                           optional
     }
+
+Why paraphrases: the original questions use the report's own terms
+("revenue from operations"), which favours keyword search (Finding F12).
+Users say "sales". Paraphrases measure how search copes with real wording.
 """
 
 from __future__ import annotations
@@ -73,7 +81,14 @@ REQUIRED = {
     "split": str,
     "verified": str,
 }
-OPTIONAL = {"notes": str}
+OPTIONAL = {"notes": str, "paraphrase_of": str}
+
+# A paraphrase must match its original on everything except id, question,
+# notes and verified: it's the same question in different words.
+PARAPHRASE_SAME_FIELDS = (
+    "doc", "expected_answer", "expected_values", "expected_pages",
+    "page_match", "statement", "category", "split",
+)
 
 
 def validate(entry: dict) -> list[str]:
@@ -156,6 +171,24 @@ def load(path: Path = DATASET_PATH) -> list[dict]:
             problems.append(f"{label}: duplicate id")
         seen.add(entry.get("id"))
         entries.append(entry)
+
+    # Paraphrases: the original must exist, not be a paraphrase itself, and
+    # match on answer, pages and SPLIT (a paraphrase of a held-out test
+    # question in the dev split would leak the test set into tuning).
+    by_id = {e.get("id"): e for e in entries}
+    for entry in entries:
+        original_id = entry.get("paraphrase_of")
+        if original_id is None:
+            continue
+        original = by_id.get(original_id)
+        if original is None:
+            problems.append(f"{entry['id']}: paraphrase_of '{original_id}' does not exist")
+        elif "paraphrase_of" in original:
+            problems.append(f"{entry['id']}: paraphrase_of points to another paraphrase")
+        else:
+            for field in PARAPHRASE_SAME_FIELDS:
+                if entry.get(field) != original.get(field):
+                    problems.append(f"{entry['id']}: '{field}' differs from its original {original_id}")
 
     if problems:
         raise ValueError("golden dataset has problems:\n" + "\n".join(problems))

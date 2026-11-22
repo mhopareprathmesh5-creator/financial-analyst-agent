@@ -45,8 +45,10 @@ def index_dir(tmp_path, monkeypatch, fake_embeddings):
     monkeypatch.setattr(store, "get_embeddings", lambda: fake_embeddings)
     # Start each test with an empty memory cache, so tests don't affect each other.
     store._STORE_CACHE.clear()
+    store._BM25_CACHE.clear()
     yield tmp_path / "indexes"  # the test runs here
     store._STORE_CACHE.clear()  # clean up after the test
+    store._BM25_CACHE.clear()
 
 
 @pytest.fixture

@@ -55,6 +55,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 import config
+from rag.keyword_search import BM25Index, rrf_merge
 from rag.text_repair import repair_text
 
 # Optional progress callback: called as on_progress(fraction_done, message),
@@ -71,6 +72,10 @@ def _no_progress(fraction: float, message: str) -> None:
 # the first search in a chat we keep its index in memory and reuse it for
 # every later question.
 _STORE_CACHE: dict[str, FAISS] = {}
+
+# Keyword (BM25) indexes, same keys as _STORE_CACHE. Built from the FAISS
+# index's chunks on first use; cheap to rebuild, so never saved to disk.
+_BM25_CACHE: dict[str, BM25Index] = {}
 
 # Allowed thread ids: only letters, digits, "_" and "-", 1 to 64 characters.
 # UUIDs like "3f2a91bc-..." pass; something like "../secrets" fails.
@@ -152,6 +157,19 @@ def list_documents(thread_id: str) -> list[dict]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def page_heading(text: str, max_lines: int = 2, max_chars: int = 150) -> str:
+    """The page's heading: its first lines, which in annual reports are the
+    section name and the page title, e.g.
+        "Consolidated Financial Statements 2024-25 178 | Consolidated Balance Sheet"
+
+    Lines with fewer than 2 words are skipped: on rotated (landscape) pages
+    pdfplumber reads the vertical margin text one word per line ("Infosys",
+    "Integrated", "Annual"), which isn't a heading.
+    """
+    lines = [line.strip() for line in text.splitlines() if len(line.split()) >= 2]
+    return " | ".join(lines[:max_lines])[:max_chars]
+
+
 def _load_pages(
     file_bytes: bytes,
     filename: str,
@@ -182,8 +200,9 @@ def _load_pages(
                     Document(
                         page_content=text,
                         # `number` starts at 1, so citations match the page
-                        # number a PDF viewer shows.
-                        metadata={"source": filename, "page": number},
+                        # number a PDF viewer shows. The heading travels with
+                        # every chunk cut from this page (see ingest_pdf).
+                        metadata={"source": filename, "page": number, "heading": page_heading(text)},
                     )
                 )
             on_progress(number / total, f"Reading page {number} of {total}")
@@ -294,11 +313,22 @@ def ingest_pdf(
         chunk_overlap=config.CHUNK_OVERLAP,
         separators=["\n\n", "\n", " ", ""],
     )
-    # Each chunk keeps its page's metadata (source + page number).
+    # Each chunk keeps its page's metadata (source, page number, heading).
     chunks = splitter.split_documents(pages)
 
-    # Step 4: embed into FAISS. This calls the embeddings API for every
-    # chunk, so it's the other slow step; tell the UI what's happening.
+    # Step 3b (optional, config.CHUNK_HEADINGS): start every chunk with its
+    # page heading. Without it, a chunk cut from the middle of the P&L is just
+    # rows of numbers and can't be told apart from the standalone P&L or a
+    # subsidiary table (Finding F10). The heading is embedded with the chunk,
+    # and the LLM sees it too.
+    if config.CHUNK_HEADINGS:
+        for chunk in chunks:
+            heading = chunk.metadata.get("heading", "")
+            if heading:
+                chunk.page_content = f"[{heading}]\n{chunk.page_content}"
+
+    # Step 4: embed every chunk with the local model; the other slow step,
+    # so tell the UI what's happening.
     on_progress(1.0, f"Embedding {len(chunks)} chunks…")
     embeddings = embeddings or get_embeddings()
     store = load_store(key, embeddings)
@@ -329,6 +359,8 @@ def ingest_pdf(
     )
 
     _STORE_CACHE[str(folder)] = store
+    # The chunk list changed, so the keyword index must be rebuilt next time.
+    _BM25_CACHE.pop(str(folder), None)
     # {**entry, ...} copies all keys of entry and adds "already_indexed".
     return {**entry, "already_indexed": False}
 
@@ -341,12 +373,65 @@ def search(
 ) -> list[Document]:
     """Return the top-k passages for the query, from this chat's PDFs only.
 
-    FAISS embeds the query and finds the k chunks whose vectors are closest
-    to it (most similar meaning). Each result is a Document with
-    .page_content (the text) and .metadata ({"source": ..., "page": ...}).
-    Returns [] if this chat has no PDF.
+    How depends on config.RETRIEVAL_MODE:
+        "vector"  FAISS embeds the query and returns the k chunks whose
+                  vectors are closest (most similar meaning)
+        "bm25"    the k chunks that best match the query's exact words
+        "hybrid"  both searches return HYBRID_CANDIDATES chunks each; the two
+                  lists are merged with Reciprocal Rank Fusion
+
+    With config.QUERY_REWRITES > 0, an LLM first rewrites the query into
+    annual-report terminology (rag/query_rewrite.py). The original query and
+    every rewrite are searched, and all the ranked lists are merged with RRF.
+
+    Each result is a Document with .page_content (the text) and .metadata
+    ({"source": ..., "page": ..., "heading": ...}). Returns [] if this chat
+    has no PDF.
     """
     store = load_store(thread_id, embeddings)
     if store is None:
         return []
-    return store.similarity_search(query, k=k or config.TOP_K)
+    k = k or config.TOP_K
+    mode = config.RETRIEVAL_MODE
+    if mode not in ("vector", "bm25", "hybrid"):
+        raise ValueError(f"Unknown RETRIEVAL_MODE {mode!r}; use vector, bm25 or hybrid")
+
+    queries = [query]
+    if config.QUERY_REWRITES > 0:
+        # Imported here so the app doesn't need the rewriter unless it's on.
+        from rag import query_rewrite
+
+        queries += query_rewrite.rewrite(query, config.QUERY_REWRITES)
+
+    # One query, one search mode: return directly (no merging needed).
+    if len(queries) == 1 and mode != "hybrid":
+        return _ranked_lists(store, thread_id, query, k, mode)[0]
+
+    # Otherwise merge. Take more candidates than needed from each list, so a
+    # chunk ranked e.g. 15th by one list can still win if others rank it high.
+    n = max(k, config.HYBRID_CANDIDATES)
+    lists = [lst for q in queries for lst in _ranked_lists(store, thread_id, q, n, mode)]
+    return rrf_merge(lists, k=k, rrf_k=config.RRF_K)
+
+
+def _ranked_lists(store: FAISS, thread_id: str, query: str, n: int, mode: str) -> list[list[Document]]:
+    """The ranked result list(s) for one query: one list for "vector" or
+    "bm25", two (vector + keyword) for "hybrid"."""
+    lists = []
+    if mode in ("vector", "hybrid"):
+        lists.append(store.similarity_search(query, k=n))
+    if mode in ("bm25", "hybrid"):
+        lists.append(_bm25_index(thread_id, store).search(query, n))
+    return lists
+
+
+def _bm25_index(thread_id: str, store: FAISS) -> BM25Index:
+    """The keyword index for this chat, built from the same chunks as its
+    FAISS index the first time it's needed, then cached."""
+    key = str(_thread_dir(thread_id))
+    if key not in _BM25_CACHE:
+        # FAISS keeps every chunk in its "docstore"; index_to_docstore_id
+        # lists their ids in insertion order.
+        docs = [store.docstore.search(doc_id) for doc_id in store.index_to_docstore_id.values()]
+        _BM25_CACHE[key] = BM25Index(docs)
+    return _BM25_CACHE[key]

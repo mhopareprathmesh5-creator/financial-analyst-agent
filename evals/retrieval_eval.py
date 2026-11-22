@@ -35,9 +35,12 @@ from pathlib import Path
 import config
 from evals.datasets import schema
 from evals.graders import retrieval_metrics as m
-from rag import store
+from rag import query_rewrite, store
 
 REPORTS_DIR = Path(__file__).resolve().parent / "reports"
+# Query rewrites from the LLM, cached so reruns don't call Gemini again and
+# give identical results. Committed to git: it makes runs reproducible.
+REWRITE_CACHE_PATH = Path(__file__).resolve().parent / "cache" / "rewrites.json"
 PDF_DIR = config.PROJECT_ROOT / "data" / "reports"
 K_VALUES = (1, 4, 10)  # 4 is what the app uses today (config.TOP_K)
 SUMMARY_METRICS = ["hit@1", "hit@4", "hit@10", "mrr", "page_recall@4", "value_hit@4"]
@@ -45,9 +48,12 @@ SUMMARY_METRICS = ["hit@1", "hit@4", "hit@10", "mrr", "page_recall@4", "value_hi
 
 def eval_thread_id(doc: str) -> str:
     """Index name for one report under the current configuration, e.g.
-    "eval-tcs_ar_fy25-c1000-o200". The embedding model is already part of the
-    index folder (indexes/<model>/...), so it isn't repeated here."""
-    return f"eval-{Path(doc).stem}-c{config.CHUNK_SIZE}-o{config.CHUNK_OVERLAP}"
+    "eval-tcs_ar_fy25-c1000-o200" or, with chunk headings, "...-o200-h1".
+    Every setting that changes the index must appear here, otherwise an
+    experiment would silently reuse an index built with other settings. The
+    embedding model is already part of the folder (indexes/<model>/...)."""
+    name = f"eval-{Path(doc).stem}-c{config.CHUNK_SIZE}-o{config.CHUNK_OVERLAP}"
+    return name + ("-h1" if config.CHUNK_HEADINGS else "")
 
 
 def ensure_indexed(doc: str) -> dict:
@@ -100,8 +106,13 @@ def score_entry(entry: dict, k_max: int) -> dict:
         "id": entry["id"],
         "doc": entry["doc"],
         "category": entry["category"],
+        "wording": "paraphrase" if "paraphrase_of" in entry else "original",
+        "paraphrase_of": entry.get("paraphrase_of"),
         "question": entry["question"],
         "expected_pages": pages,
+        # What the LLM rewrote the question into (empty when rewriting is off),
+        # kept so the rewrites themselves can be read and judged.
+        "rewrites": query_rewrite.rewrite(entry["question"], config.QUERY_REWRITES),
         "retrieved_pages": [r["page"] for r in retrieved],
         # Kept for the DeepEval step, which judges the retrieved text itself.
         "retrieved_texts": [r["text"] for r in retrieved],
@@ -128,6 +139,23 @@ def summarise(results: list[dict], key: str | None = None) -> dict:
     }
 
 
+def summarise_wording(results: list[dict]) -> dict:
+    """Original vs paraphrased wording. The fair comparison is each
+    paraphrase against ITS OWN original (same answer, same pages), so the
+    originals that have a paraphrase get their own row."""
+    paraphrased_ids = {r["paraphrase_of"] for r in results if r["paraphrase_of"]}
+    groups = {
+        "original (all)": [r for r in results if r["wording"] == "original"],
+        "original (paraphrased ones)": [r for r in results if r["id"] in paraphrased_ids],
+        "paraphrase": [r for r in results if r["wording"] == "paraphrase"],
+    }
+    return {
+        name: {"n": len(rows), **{metric: average(rows, metric) for metric in SUMMARY_METRICS}}
+        for name, rows in groups.items()
+        if rows
+    }
+
+
 def fmt(value: float | None) -> str:
     return "–" if value is None else f"{value:.3f}"
 
@@ -146,7 +174,14 @@ def write_markdown(path: Path, run: dict):
         f"Mean search latency: {run['mean_latency_s']:.3f} s per question",
         "",
     ]
-    tables = [("Overall", run["overall"]), ("By category", run["by_category"]), ("By report", run["by_doc"])]
+    tables = [
+        ("Overall", run["overall"]),
+        # Compare experiments on "original (all)": it's the same questions in
+        # every run, while "Overall" also includes paraphrases.
+        ("By wording", run["by_wording"]),
+        ("By category", run["by_category"]),
+        ("By report", run["by_doc"]),
+    ]
     for title, table in tables:
         lines += [f"## {title}", "", "| Group | n | " + " | ".join(SUMMARY_METRICS) + " |",
                   "|---|---|" + "---|" * len(SUMMARY_METRICS)]
@@ -178,7 +213,11 @@ def main():
     entries = [e for e in schema.load() if args.split == "all" or e["split"] == args.split]
     entries = [e for e in entries if e["category"] != "not_in_report"]
 
-    indexing = [i for i in (ensure_indexed(d) for d in sorted({e["doc"] for e in entries})) if i["indexed_now"]]
+    # Rewrites go through the file cache during evals (search() calls the
+    # rewriter, and score_entry() reads the same cached rewrites back).
+    query_rewrite.CACHE = query_rewrite.RewriteCache(REWRITE_CACHE_PATH)
+
+    indexing =[i for i in (ensure_indexed(d) for d in sorted({e["doc"] for e in entries})) if i["indexed_now"]]
     results = [score_entry(e, k_max=max(K_VALUES)) for e in entries]
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -187,10 +226,15 @@ def main():
         "time": stamp,
         "split": args.split,
         "config": {"EMBEDDING_MODEL": config.EMBEDDING_MODEL, "CHUNK_SIZE": config.CHUNK_SIZE,
-                   "CHUNK_OVERLAP": config.CHUNK_OVERLAP, "k_values": list(K_VALUES)},
+                   "CHUNK_OVERLAP": config.CHUNK_OVERLAP, "CHUNK_HEADINGS": config.CHUNK_HEADINGS,
+                   "RETRIEVAL_MODE": config.RETRIEVAL_MODE, "HYBRID_CANDIDATES": config.HYBRID_CANDIDATES,
+                   "RRF_K": config.RRF_K, "QUERY_REWRITES": config.QUERY_REWRITES,
+                   "REWRITE_MODEL": config.REWRITE_MODEL if config.QUERY_REWRITES else None,
+                   "k_values": list(K_VALUES)},
         "n_questions": len(results),
         "mean_latency_s": statistics.mean(r["latency_s"] for r in results),
         "overall": summarise(results),
+        "by_wording": summarise_wording(results),
         "by_category": summarise(results, "category"),
         "by_doc": summarise(results, "doc"),
         "indexing": indexing,
@@ -202,8 +246,8 @@ def main():
     base.with_suffix(".json").write_text(json.dumps(run, indent=2, ensure_ascii=False), encoding="utf-8")
     write_markdown(base.with_suffix(".md"), run)
 
-    overall = run["overall"]["all"]
-    print("\n" + " | ".join(f"{k} {fmt(overall[k])}" for k in SUMMARY_METRICS))
+    for name, row in run["by_wording"].items():
+        print(f"{name:<28} n={row['n']:<3} " + " | ".join(f"{k} {fmt(row[k])}" for k in SUMMARY_METRICS))
     print(f"Report: {base.with_suffix('.md')}")
 
 

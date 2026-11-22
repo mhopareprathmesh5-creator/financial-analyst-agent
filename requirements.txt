@@ -19,7 +19,11 @@ sentence-transformers
 # pdfplumber was chosen by measurement over pypdf/PyMuPDF/pymupdf4llm
 # (experiments/pdf_readers/, Finding F2 in CLAUDE.md)
 pdfplumber
-faiss-cpu
+# Pinned: on the owner's PC, Windows Smart App Control blocks the DLLs of
+# faiss-cpu 1.15.0 and 1.16.0 but allows 1.12.0 (Finding F14).
+faiss-cpu==1.12.0
+# Keyword (BM25) search for hybrid retrieval
+rank-bm25
 
 # Tools
 ddgs

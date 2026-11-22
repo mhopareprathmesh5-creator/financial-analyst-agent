@@ -205,3 +205,78 @@ Only measured or verified facts; each names the file that produced it. Include f
 - What search returns instead: **TCS** — summary/narrative pages (p88 MD&A overview, p22–23 Financial Capital, p70 Board's report) for nearly every financial question. **Infosys** — the subsidiary financials table (AOC-1, p45–48: every subsidiary's turnover and profit) and p73, which look like "revenue/profit" text but are about other entities.
 - Indexing time on this run: Infosys 369 pages → 1,570 chunks, read 59.9 s + embed 242.8 s; TCS 336 pages → 1,415 chunks, read 122.4 s + embed 211.6 s.
 - Hypotheses to test, one at a time: table chunks lose their heading (a chunk from the middle of the P&L doesn't say "Consolidated Statement of Profit and Loss"); a small embedding model is weak on number-heavy tables; exact terms like "Revenue from operations" need keyword search (BM25); a reranker; broken TCS word spacing (F4).
+
+### F11. Experiment 1: page headings on every chunk (2026-11-21, Phase B)
+- Change: `CHUNK_HEADINGS=1` prepends each page's heading (first 2 lines with ≥2 words, e.g. "Consolidated Financial Statements 2024-25 | Consolidated Statement of Profit and Loss") to every chunk from that page. Code: `rag/store.py` `page_heading()`; tests in `tests/test_pdf_reading.py`.
+- Run: `evals/reports/retrieval_20261121-225734_headings.md` vs baseline (F10), same 37 dev questions.
+
+| Metric | Baseline | Headings |
+|---|---|---|
+| hit@1 | 2.7% (1) | **13.5% (5)** |
+| hit@4 | 24.3% (9) | **29.7% (11)** |
+| hit@10 | 37.8% | 40.5% |
+| MRR | 0.140 | **0.200** |
+| value_hit@4 | 29.6% | 37.0% |
+| TCS / Infosys hit@4 | 27.8% / 21.1% | **38.9%** / 21.1% |
+
+- Per question: hit@1 **+4 gained, 0 lost** (TCS consolidated EPS, UK revenue, TCS and Infosys consolidated operating cash flow). hit@4 +4 gained (TCS standalone EPS, UK revenue, headcount, Infosys consolidated EPS), **2 lost**.
+- Prediction made before the run held: TCS improved (its pages are titled "Consolidated …" / "Standalone …"), Infosys didn't.
+- Loss analysis: `inf-ocf-stand-01` — Infosys's standalone statements are titled without "Standalone" ("Statement of Cash Flows"), while consolidated ones say "Consolidated …", so a "standalone" question now matches the consolidated page more strongly. `tcs-attrition-01` — heading text added noise to a prose chunk.
+- Caveat: 37 questions, 1 question = 2.7 points; the hit@4 gain is +2 questions net. The ranking gain (hit@1, MRR, zero rank-1 losses) is the stronger evidence.
+- Still ~70% of questions miss at k=4: headings help ranking but don't fix the main problem.
+- **Decision: headings kept, now on by default** (`CHUNK_HEADINGS=1`).
+
+### F12. Experiment 2: keyword (BM25) and hybrid search (2026-11-21, Phase B)
+- Code: `rag/keyword_search.py` (BM25 via `rank-bm25`, RRF merge); `config.RETRIEVAL_MODE` = vector | bm25 | hybrid; hybrid = 20 candidates from each search, RRF with k=60. Tests: `tests/test_keyword_search.py`. All runs with headings, same 37 dev questions, same indexes.
+- Reproducibility check: the vector run reproduced F11 exactly (hit@4 29.7%).
+
+| Mode | hit@1 | hit@4 | hit@10 | MRR | value_hit@4 |
+|---|---|---|---|---|---|
+| vector | 13.5% | 29.7% | 40.5% | 0.200 | 37.0% |
+| **bm25** | **29.7%** | **59.5%** | **73.0%** | **0.431** | **63.0%** |
+| hybrid (equal-weight RRF) | 21.6% | 48.6% | 73.0% | 0.362 | 55.6% |
+
+- vector → bm25 at hit@4: **+15 gained, 4 lost**; every category improves (fact 27→55%, narrative 14→57%, calculation 20→60%, consolidated-vs-standalone 50→63%); Infosys 21→68%, TCS 39→50%.
+- **Hybrid is worse than BM25 alone** (bm25 → hybrid: +3 gained, 7 lost at hit@4). Equal-weight RRF assumes both searches are comparably good; here vector is much weaker, so its rankings push BM25's correct chunks out of the top 4. Fusion only helps when the retrievers are of similar quality.
+- hit@10 is 73% for both bm25 and hybrid: the right page is usually in the top 10 but ranked too low → a reranker over the top candidates is the natural next step.
+- **Caveat about our own dataset:** the golden questions were written with the report's own terms ("revenue from operations", "statutory auditors", "attrition"), which favours keyword search. Users paraphrase ("sales", "who audits"), where vector search should help. BM25's lead is probably overstated; paraphrased question variants would test this.
+- A unit test caught a BM25 subtlety while building: in standard BM25 a word present in ≥ half of all chunks gets zero weight (IDF = log 1), so "drop chunks scoring 0" wrongly drops matching chunks. Fixed by filtering on word overlap instead.
+- Remaining TCS misses often return p155 (several times in the top 10), and broken word spacing ("Co n s o lid ated", F4) breaks keyword matching on TCS narrative pages.
+
+### F13. Paraphrased questions: BM25's lead was mostly our dataset's wording (2026-11-21, Phase B)
+- Added 17 paraphrases (`paraphrase_of` field; 14 dev, 3 test) of existing questions in users' own words, avoiding report terms ("total group sales" for revenue from operations, "finance chief" for CFO, "which firm audits" for statutory auditors). Same answers and pages; `schema.py` enforces same split as the original. Dataset now 77 entries.
+- Runs: `evals/reports/retrieval_*_para-{vector,bm25,hybrid}.md`; report has a "By wording" table. Fair comparison = the 14 dev paraphrases vs their own 14 originals (1 question = 7.1 points):
+
+| Mode | hit@4, report's wording | hit@4, user's wording |
+|---|---|---|
+| vector | 21.4% | 21.4% |
+| bm25 | **50.0%** | **14.3%** |
+| hybrid | 42.9% | 21.4% |
+
+- **BM25 collapses on user wording** (it matches words; "sales" never finds "revenue from operations"). Vector is wording-robust but weak overall. Hybrid is the safest: near BM25 on report wording, never below vector on user wording.
+- **For real users, every mode scores 14–21% hit@4.** The core problem is vocabulary mismatch between users and annual reports.
+- The F12 caveat is confirmed: a dataset written in the source document's own terms overstates keyword search.
+- Fix candidates, to measure next: query rewriting (an LLM rewrites the question into report terminology), a cross-encoder reranker, a stronger embedding model.
+
+### F14. Windows Smart App Control blocked FAISS; fixed by pinning a trusted version (2026-11-22, environment)
+- After working until 2026-11-21, `import faiss` failed: `DLL load failed while importing _swigfaiss: An Application Control policy has blocked this file`. 16 tests and every search failed. No project change caused it.
+- Windows Code Integrity log: Smart App Control state **1 (enforcing)**; 68 block events since 2026-11-16 (the PyTorch block on 2026-11-18 was one of them). Smart App Control judges each file by Microsoft cloud reputation, and the verdict can change over time; it has **no per-file exceptions**.
+- Owner chose to keep FAISS and keep Smart App Control on. Tried other official releases: **faiss-cpu 1.15.0 and 1.16.0 blocked; 1.12.0 allowed.** All 72 tests pass on 1.12.0; pinned in `requirements.txt`.
+- Risk remains: any unsigned native library (FAISS, PyTorch) can be blocked again at any time. Fallbacks if it recurs: another faiss-cpu version, NumPy-based vector search (also removes the deprecated `langchain-community` FAISS wrapper), or running in WSL.
+- Reproducibility check after the switch: hybrid without rewriting (`retrieval_*_repro-hybrid.md`) reproduced F13 exactly, so neither faiss 1.12.0 nor the refactored `search()` changed results.
+
+### F15. Experiment 3: query rewriting, prompt v1 (2026-11-22, Phase B)
+- Code: `rag/query_rewrite.py` (Gemini `gemini-3.1-flash-lite-preview`, temperature 0, general instructions only, no dataset term mappings — enforced by a test); `config.QUERY_REWRITES=3`; original + 3 rewrites searched in hybrid mode, all 8 ranked lists merged with RRF. Rewrites cached in `evals/cache/rewrites.json` (51 Gemini calls, once).
+- Run: `retrieval_*_hybrid-rewrite3.md` vs `retrieval_*_repro-hybrid.md`.
+
+| hit@4 | hybrid | hybrid + 3 rewrites |
+|---|---|---|
+| user's wording (14 paraphrases) | 21.4% | **35.7%** |
+| report's wording, same 14 originals | 42.9% | 28.6% |
+| all 37 originals | 48.6% | 48.6% (hit@10 73.0% → 64.9%; value_hit@4 55.6% → 66.7%) |
+
+- Per question at hit@4: **9 gained, 7 lost**. Rewriting moves questions around more than it helps.
+- **Rewrite quality is good on vocabulary:** "total group sales" → "consolidated revenue from operations"; "cash the group's day-to-day business brought in" → "net cash generated from operating activities"; "what companies did Infosys buy" → "business combinations and acquisitions".
+- **Failure 1 — the rewriter adds facts:** with no year in the question, Gemini inserted the wrong one ("TCS annual report **2023-24** Chief Financial Officer", "statutory auditor … financial year **2023-24**"; the report is 2024-25), despite "don't add facts" in the prompt.
+- **Failure 2 — verbose boilerplate:** rewrites like "Tata Consultancy Services Limited consolidated … for the financial year ended March 31, 2025" are full of words found on hundreds of pages; BM25 then favours generic pages (TCS p302, p200, p186) over the statements, and the original question is only 2 of 8 merged lists. Most losses are questions that worked before (TCS revenue, profit, dividend).
+- Overfitting caution: further prompt tuning is evaluated on the same dev questions; only general rules are allowed, and the untouched test split gives the final number.
